@@ -1599,7 +1599,7 @@ bsd_init_file="""\
 export PATH=$PATH:/usr/local/bin
 name="waagent"
 rcvar="waagent_enable"
-command="/usr/sbin/${name}"
+command="/usr/local/sbin/${name}"
 command_interpreter="/usr/local/bin/python"
 waagent_flags=" daemon &"
 
@@ -1676,11 +1676,11 @@ class FreeBSDDistro(AbstractDistro):
         self.dhcp_client_name='dhclient'
         self.requiredDeps = [ 'route', 'shutdown', 'ssh-keygen', 'pw'
                               , 'openssl', 'fdisk', 'sed', 'grep' , 'sudo']
-        self.init_script_file='/etc/rc.d/waagent'
+        self.init_script_file='/usr/local/etc/rc.d/waagent'
         self.init_file=bsd_init_file
         self.agent_package_name='WALinuxAgent'
         self.fileBlackList = [ "/root/.bash_history", "/var/log/waagent.log",'/etc/resolv.conf' ]        
-        self.agent_files_to_uninstall = ["/etc/waagent.conf"]
+        self.agent_files_to_uninstall = ["/usr/local/etc/waagent.conf"]
         self.grubKernelBootOptionsFile = '/boot/loader.conf'
         self.grubKernelBootOptionsLine = ''
         self.getpidcmd = 'pgrep -n'
@@ -1925,7 +1925,7 @@ class FreeBSDDistro(AbstractDistro):
         set resource disk as swap.
         """
         global DiskActivated
-        Run('cp /usr/sbin/waagent /tmp/')
+        Run('cp /usr/local/sbin/waagent /tmp/')
         SetFileContents('/tmp/bsd_activate_resource_disk.py',bsd_activate_resource_disk_txt)
         Run('chmod +x /tmp/bsd_activate_resource_disk.py')
         pid = subprocess.Popen(["/tmp/bsd_activate_resource_disk.py", ""]).pid
@@ -1937,10 +1937,10 @@ class FreeBSDDistro(AbstractDistro):
         """
         Install the agent service.
         Check dependencies.
-        Create /etc/waagent.conf and move old version to
-        /etc/waagent.conf.old
+        Create /usr/local/etc/waagent.conf and move old version to
+        /usr/local/etc/waagent.conf.old
         Copy RulesFiles to /var/lib/waagent
-        Create /etc/logrotate.d/waagent
+        Create /usr/local/etc/logrotate.d/waagent
         Set /etc/ssh/sshd_config ClientAliveInterval to 180
         Call ApplyVNUMAWorkaround()
         """
@@ -1955,17 +1955,17 @@ class FreeBSDDistro(AbstractDistro):
                 shutil.move(a, ".")
                 Warn("Moved " + a + " -> " + LibDir + "/" + GetLastPathElement(a) )
         MyDistro.registerAgentService()
-        if os.path.isfile("/etc/waagent.conf"):
+        if os.path.isfile("/usr/local/etc/waagent.conf"):
             try:
-                os.remove("/etc/waagent.conf.old")
+                os.remove("/usr/local/etc/waagent.conf.old")
             except:
                 pass
             try:
-                os.rename("/etc/waagent.conf", "/etc/waagent.conf.old")
-                Warn("Existing /etc/waagent.conf has been renamed to /etc/waagent.conf.old")
+                os.rename("/usr/local/etc/waagent.conf", "/usr/local/etc/waagent.conf.old")
+                Warn("Existing /usr/local/etc/waagent.conf has been renamed to /usr/local/etc/waagent.conf.old")
             except:
                 pass
-        SetFileContents("/etc/waagent.conf", self.waagent_conf_file)
+        SetFileContents("/usr/local/etc/waagent.conf", self.waagent_conf_file)
         if os.path.exists('/usr/local/etc/logrotate.d/'):
             SetFileContents("/usr/local/etc/logrotate.d/waagent", WaagentLogrotate)
         filepath = "/etc/ssh/sshd_config"
@@ -2013,6 +2013,9 @@ class FreeBSDDistro(AbstractDistro):
 
     def setBlockDeviceTimeout(self, device, timeout):
         return
+
+    def getConfigurationPath(self):
+        return "/usr/local/etc/waagent.conf"
 
     def getProcessorCores(self):
         return int(RunGetOutput("sysctl hw.ncpu | awk '{print $2}'")[1])
