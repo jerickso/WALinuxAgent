@@ -1690,7 +1690,7 @@ class FreeBSDDistro(AbstractDistro):
         
     def installAgentServiceScriptFiles(self):
         SetFileContents(self.init_script_file, self.init_file)
-        os.chmod(self.init_script_file, 0777)
+        os.chmod(self.init_script_file, 0744)
         AppendFileContents("/etc/rc.conf","waagent_enable='YES'\n")
         return 0
 
