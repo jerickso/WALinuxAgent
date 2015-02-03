@@ -1955,17 +1955,19 @@ class FreeBSDDistro(AbstractDistro):
                 shutil.move(a, ".")
                 Warn("Moved " + a + " -> " + LibDir + "/" + GetLastPathElement(a) )
         MyDistro.registerAgentService()
-        if os.path.isfile("/usr/local/etc/waagent.conf"):
+
+        waagent_conf = self.getConfigurationPath()
+        if os.path.isfile(waagent_conf):
             try:
-                os.remove("/usr/local/etc/waagent.conf.old")
+                os.remove(waagent_conf + ".old")
             except:
                 pass
             try:
-                os.rename("/usr/local/etc/waagent.conf", "/usr/local/etc/waagent.conf.old")
-                Warn("Existing /usr/local/etc/waagent.conf has been renamed to /usr/local/etc/waagent.conf.old")
+                os.rename(waagent_conf, waagent_conf+".old")
+                Warn("Existing %s has been renamed to %s.old" % (waagent_conf, waagent_conf))
             except:
                 pass
-        SetFileContents("/usr/local/etc/waagent.conf", self.waagent_conf_file)
+        SetFileContents(waagent_conf, self.waagent_conf_file)
         if os.path.exists('/usr/local/etc/logrotate.d/'):
             SetFileContents("/usr/local/etc/logrotate.d/waagent", WaagentLogrotate)
         filepath = "/etc/ssh/sshd_config"
@@ -2015,7 +2017,12 @@ class FreeBSDDistro(AbstractDistro):
         return
 
     def getConfigurationPath(self):
-        return "/usr/local/etc/waagent.conf"
+        if os.path.isfile("/etc/waagent.conf"):
+            ret = "/etc/waagent.conf"
+            Warn("Use of /etc/waagent.conf is deprecated.  Move the config file to /usr/local/etc/waagent.conf")
+        else:
+            ret = "/usr/local/etc/waagent.conf"
+        return ret
 
     def getProcessorCores(self):
         return int(RunGetOutput("sysctl hw.ncpu | awk '{print $2}'")[1])
