@@ -2016,6 +2016,19 @@ class FreeBSDDistro(AbstractDistro):
     def setBlockDeviceTimeout(self, device, timeout):
         return
 
+    def isDHCPEnabled(self):
+        running = False
+        err, stdout = RunGetOutput("service " + self.dhcp_client_name + "status hn0", chk_err=False)
+        if "is running" in stdout:
+            running = True
+        return running
+
+    def startDHCP(self):
+        Run("service " + self.dhcp_client_name + " start hn0", chk_err=False)
+
+    def stopDHCP(self):
+        Run("service " + self.dhcp_client_name + " stop hn0", chk_err=False)
+
     def getConfigurationPath(self):
         if os.path.isfile("/etc/waagent.conf"):
             ret = "/etc/waagent.conf"
@@ -4778,6 +4791,7 @@ class Agent(Util):
         sleepDurations = [0, 10, 30, 60, 60]
         maxRetry = len(sleepDurations)
         lastTry = (maxRetry - 1)
+        dhcpEnabled = False
         for retry in range(0, maxRetry):
             try:
                 #Open DHCP port if iptables is enabled.
@@ -4812,6 +4826,7 @@ class Agent(Util):
                     else:
                         Run("route add 255.255.255.255 dev " + ifname,chk_err=False)
                 if MyDistro.isDHCPEnabled():
+                    dhcpEnabled = True
                     MyDistro.stopDHCP()
                 sock.bind(("0.0.0.0", 68)) 
                 sock.sendto(sendData, ("<broadcast>", 67))
@@ -4843,7 +4858,7 @@ class Agent(Util):
                         Run("route del -net 255.255.255.255 -iface " + ifname,chk_err=False)
                     else:
                         Run("route del 255.255.255.255 dev " + ifname,chk_err=False)  # We supress error logging on error.
-                if MyDistro.isDHCPEnabled():
+                if dhcpEnabled:
                     MyDistro.startDHCP()
         return None
 
