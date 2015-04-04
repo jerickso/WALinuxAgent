@@ -1598,7 +1598,7 @@ export PATH=$PATH:/usr/local/bin
 name="waagent"
 rcvar="waagent_enable"
 command="/usr/local/sbin/${name}"
-command_interpreter="/usr/local/bin/python"
+command_interpreter="python"
 waagent_flags=" daemon &"
 
 pidfile="/var/run/waagent.pid"
