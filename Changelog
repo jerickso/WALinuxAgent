@@ -1,5 +1,11 @@
 WALinuxAgent                                                          Changelog
 |||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||
+15 Jan 2015, WALinuxAgent 2.0.12
+   . Add support for page blob status report
+
+11 Dec 2014, WALinuxAgent 2.0.11
+   . Add support for GPT(Guid Partition Table)
+
 27 Nov 2014, WALinuxAgent 2.0.10
    . Multiple fixes for openSUSE-13.2+
    . Multiple fixes for FreeBSD
