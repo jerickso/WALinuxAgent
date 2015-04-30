@@ -589,7 +589,7 @@ class AbstractDistro(object):
 
     def stopDHCP(self):
         """
-        Stop the system DHCP client so that tha agent can bind on its port. If
+        Stop the system DHCP client so that the agent can bind on its port. If
         the distro has set dhcp_enabled to True, it will need to provide an
         implementation of this method.
         """
@@ -4618,7 +4618,7 @@ class WALAEventMonitor(WALAEvent):
         if not self.issysteminfoinitilized:
             self.issysteminfoinitilized=True
             try:
-                self.sysInfo["OSVersion"]=platform.system()+":"+"-".join(DistInfo())+":"+platform.release()
+                self.sysInfo["OSVersion"]=platform.system()+":"+"-".join(DistInfo(1))+":"+platform.release()
                 self.sysInfo["GAVersion"]=GuestAgentVersion
                 self.sysInfo["RAM"]=MyDistro.getTotalMemory()
                 self.sysInfo["Processors"]=MyDistro.getProcessorCores()
