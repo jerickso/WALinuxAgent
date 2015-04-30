@@ -1678,7 +1678,7 @@ class FreeBSDDistro(AbstractDistro):
         self.init_file=bsd_init_file
         self.agent_package_name='WALinuxAgent'
         self.fileBlackList = [ "/root/.bash_history", "/var/log/waagent.log",'/etc/resolv.conf' ]        
-        self.agent_files_to_uninstall = ["/usr/local/etc/waagent.conf"]
+        self.agent_files_to_uninstall = ["/usr/local/etc/waagent.conf", "/usr/local/etc/logrotate.d/waagent"]
         self.grubKernelBootOptionsFile = '/boot/loader.conf'
         self.grubKernelBootOptionsLine = ''
         self.getpidcmd = 'pgrep -n'
