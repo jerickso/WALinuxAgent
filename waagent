@@ -80,7 +80,7 @@ if not hasattr(subprocess,'check_output'):
     
 GuestAgentName = "WALinuxAgent"
 GuestAgentLongName = "Windows Azure Linux Agent"
-GuestAgentVersion = "WALinuxAgent-2.0.12"
+GuestAgentVersion = "WALinuxAgent-2.0.15-pre"
 ProtocolVersion = "2012-11-30" #WARNING this value is used to confirm the correct fabric protocol.
 
 Config = None
@@ -606,6 +606,9 @@ class AbstractDistro(object):
         """
         Translate the custom data from a Base64 encoding. Default to no-op.
         """
+        decodeCustomData = Config.get("Provisioning.DecodeCustomData")
+        if decodeCustomData != None and decodeCustomData.lower().startswith("y"):
+            return base64.b64decode(data)
         return data
 
     def getConfigurationPath(self):
@@ -616,7 +619,33 @@ class AbstractDistro(object):
     
     def getTotalMemory(self):
         return int(RunGetOutput("grep MemTotal /proc/meminfo |awk '{print $2}'")[1])/1024
-        
+    
+    def getInterfaceNameByMac(self, mac):
+        ret, output = RunGetOutput("ifconfig -a")
+        if ret != 0:
+            raise Exception("Failed to get network interface info")
+        output = output.replace('\n', '')
+        match = re.search(r"(eth\d).*(HWaddr|ether) {0}".format(mac), 
+                          output, re.IGNORECASE)
+        if match is None:
+            raise Exception("Failed to get ifname with mac: {0}".format(mac))
+        output = match.group(0)
+        eths = re.findall(r"eth\d", output)
+        if eths is None or len(eths) == 0:
+            raise Exception("Failed to get ifname with mac: {0}".format(mac))
+        return eths[-1]
+
+    def configIpV4(self, ifName, addr, netmask=24):
+        ret, output = RunGetOutput("ifconfig {0} up".format(ifName))
+        if ret != 0:
+            raise Exception("Failed to bring up {0}: {1}".format(ifName, 
+                                                                 output))
+        ret, output = RunGetOutput("ifconfig {0} {1}/{2}".format(ifName, addr,
+                                                                 netmask))
+        if ret != 0:
+            raise Exception("Failed to config ipv4 for {0}: {1}".format(ifName, 
+                                                                        output))
+
 ############################################################
 #	GentooDistro
 ############################################################
@@ -1000,6 +1029,19 @@ class centosDistro(redhatDistro):
         super(centosDistro,self).__init__()
 
 
+############################################################    
+#	asianuxDistro
+############################################################    
+
+class asianuxDistro(redhatDistro):
+    """
+    Asianux Distro concrete class
+    Put Asianux specific behavior here...
+    """
+    def __init__(self):
+        super(asianuxDistro,self).__init__()
+
+
 ############################################################
 #   CoreOSDistro
 ############################################################
@@ -1020,7 +1062,7 @@ class CoreOSDistro(AbstractDistro):
         self.dhcp_client_name='systemd-networkd'
         self.getpidcmd='pidof '
         self.shadow_file_mode=0640
-        self.waagent_path='/usr/share/oem/waagent/bin'
+        self.waagent_path='/usr/share/oem/bin'
         self.python_path='/usr/share/oem/python/bin'
         self.dhcp_enabled=True
         if 'PATH' in os.environ:
@@ -1293,6 +1335,18 @@ class debianDistro(AbstractDistro):
             return 0
         
 ############################################################    
+#	KaliDistro - WIP
+#       Functioning on Kali 1.1.0a so far
+############################################################ 
+class KaliDistro(debianDistro):
+    """
+    Kali Distro concrete class
+    Put Kali specific behavior here...
+    """
+    def __init__(self):
+        super(KaliDistro,self).__init__()
+
+############################################################    
 #	UbuntuDistro
 ############################################################    
 ubuntu_upstart_file = """\
@@ -1338,18 +1392,6 @@ class UbuntuDistro(debianDistro):
 
     def registerAgentService(self):
         return self.installAgentServiceScriptFiles()
-
-    def startAgentService(self):
-        """
-        Use upstart syntax.
-        """
-        return Run('start ' + self.agent_service_name)
-        
-    def stopAgentService(self):
-        """
-        Use upstart syntax.
-        """
-        return Run('stop ' + self.agent_service_name)
     
     def uninstallAgentService(self):
         """
@@ -2539,18 +2581,22 @@ def GetFirstActiveNetworkInterfaceNonLoopback():
     """
     iface=''
     expected=16 # how many devices should I expect...
-    struct_size=40 # for 64bit the size is 40 bytes
+    is_64bits = sys.maxsize > 2**32
+    struct_size=40 if is_64bits else 32 # for 64bit the size is 40 bytes, for 32bits it is 32 bytes.
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     buff=array.array('B', b'\0' * (expected*struct_size))
     retsize=(struct.unpack('iL', fcntl.ioctl(s.fileno(), 0x8912, struct.pack('iL',expected*struct_size,buff.buffer_info()[0]))))[0]
     if retsize == (expected*struct_size) :
         Warn('SIOCGIFCONF returned more than ' + str(expected) + ' up network interfaces.')
     s=buff.tostring()
+    preferred_nic = Config.get("Network.Interface")
     for i in range(0,struct_size*expected,struct_size):
         iface=s[i:i+16].split(b'\0', 1)[0]
         if iface == b'lo':
             continue
-        else :
+        elif preferred_nic is None:
+            break
+        elif iface == preferred_nic:
             break
     return iface.decode('latin-1'), socket.inet_ntoa(s[i+20:i+24])
 
@@ -2609,12 +2655,15 @@ def DeviceForIdePort(n):
             break
     return device
 
+class HttpResourceGoneError(Exception):
+    pass
+
 class Util(object):
     """
     Http communication class.
     Base of GoalState, and Agent classes.
     """
-    __RetryWaitingInterval=10
+    RetryWaitingInterval=10
 
     def __init__(self):
         self.Endpoint = None
@@ -2622,47 +2671,82 @@ class Util(object):
     def _ParseUrl(self, url):
         secure = False
         host = self.Endpoint
-        action = url
-
-        #Strip "http[s]://hostname/" from url
+        path = url
+        port = None
+        
+        #"http[s]://hostname[:port][/]"
         if url.startswith("http://"):
             url = url[7:]
-            pos = url.index("/")
-            if pos > 0:
-                host = url[0: pos]
-                action = url[pos:]
+            if "/" in url:
+                host = url[0: url.index("/")]
+                path = url[url.index("/"):]
+            else:
+                host = url
+                path = "/"
         elif url.startswith("https://"):
             secure = True
             url = url[8:]
-            pos = url.index("/")
-            if pos > 0:
-                host = url[0:pos]
-                action = url[pos:]
-        return host, action, secure        
+            if "/" in url:
+                host = url[0: url.index("/")]
+                path = url[url.index("/"):]
+            else:
+                host = url
+                path = "/"
 
-    def _HttpRequest(self, method, host, action, data=None, 
-                     secure=False, headers=None):
-        resp = None;
+        if host is None:
+            raise ValueError("Host is invalid:{0}".format(url))
+        
+        if(":" in host):
+            pos = host.rfind(":")
+            port = int(host[pos + 1:])
+            host = host[0:pos]
+        
+        return host, port, secure, path
+
+    def GetHttpProxy(self, secure):
+        """
+        Get http_proxy and https_proxy from environment variables.
+        Username and password is not supported now.
+        """
+        host = Config.get("HttpProxy.Host")
+        port = Config.get("HttpProxy.Port")
+        return (host, port) 
+
+    def _HttpRequest(self, method, host, path, port=None, data=None, secure=False, 
+                     headers=None, proxyHost=None, proxyPort=None):
+        resp = None
+        conn = None
         try:
-            httpConnection = None
-
-            #If httplib module is not built with ssl support. Failback to http
-            if secure and hasattr(httplib, "HTTPSConnection"):
-                httpConnection = httplib.HTTPSConnection(host)
+            if secure:
+                port = 443 if port is None else port
+                if proxyHost is not None and proxyPort is not None:
+                    conn = httplib.HTTPSConnection(proxyHost, proxyPort)
+                    conn.set_tunnel(host, port)
+                    #If proxy is used, full url is needed.
+                    path = "https://{0}:{1}{2}".format(host, port, path)
+                else:
+                    conn = httplib.HTTPSConnection(host, port)
             else:
-                httpConnection = httplib.HTTPConnection(host)
+                port = 80 if port is None else port
+                if proxyHost is not None and proxyPort is not None:
+                    conn = httplib.HTTPConnection(proxyHost, proxyPort)
+                    #If proxy is used, full url is needed.
+                    path = "http://{0}:{1}{2}".format(host, port, path)
+                else:
+                    conn = httplib.HTTPConnection(host, port)
             if headers == None:
-                httpConnection.request(method, action, data)
+                conn.request(method, path, data)
             else:
-                httpConnection.request(method, action, data, headers)
-            resp = httpConnection.getresponse()
+                conn.request(method, path, data, headers)
+            resp = conn.getresponse()
         except httplib.HTTPException, e:
             Error('HTTPException {0}, args:{1}'.format(e, repr(e.args)))
         except IOError, e:
             Error('Socket IOError {0}, args:{1}'.format(e, repr(e.args)))
         return resp
 
-    def HttpRequest(self, method, url, data, headers=None, maxRetry=3):
+    def HttpRequest(self, method, url, data=None, 
+                    headers=None, maxRetry=3, chkProxy=False):
         """
         Sending http request to server
         On error, sleep 10 and maxRetry times.
@@ -2671,14 +2755,44 @@ class Util(object):
         LogIfVerbose("HTTP Req: {0} {1}".format(method, url))
         LogIfVerbose("HTTP Req: Data={0}".format(data))
         LogIfVerbose("HTTP Req: Header={0}".format(headers))
-        host, action, secure = self._ParseUrl(url)
-        resp = self._HttpRequest(method, host, action, data, secure, headers)
+        try:
+            host, port, secure, path = self._ParseUrl(url)
+        except ValueError, e:
+            Error("Failed to parse url:{0}".format(url))
+            return None
+
+        #Check proxy
+        proxyHost, proxyPort = (None, None)
+        if chkProxy:
+            proxyHost, proxyPort = self.GetHttpProxy(secure)
+
+        #If httplib module is not built with ssl support. Fallback to http
+        if secure and not hasattr(httplib, "HTTPSConnection"):
+            Warn("httplib is not built with ssl support")
+            secure = False
+            proxyHost, proxyPort = self.GetHttpProxy(secure)
+        
+        #If httplib module doesn't support https tunnelling. Fallback to http
+        if secure and \
+                proxyHost is not None and \
+                proxyPort is not None and \
+                not hasattr(httplib.HTTPSConnection, "set_tunnel"):
+            Warn("httplib doesn't support https tunnelling(new in python 2.7)")
+            secure = False
+            proxyHost, proxyPort = self.GetHttpProxy(secure)
+
+        resp = self._HttpRequest(method, host, path, port=port, data=data, 
+                                 secure=secure, headers=headers,
+                                 proxyHost=proxyHost, proxyPort=proxyPort)
         for retry in range(0, maxRetry):
             if resp is not None and \
                    (resp.status == httplib.OK or \
                     resp.status == httplib.CREATED or \
                     resp.status == httplib.ACCEPTED):
                 return resp;
+
+            if resp is not None and resp.status == httplib.GONE:
+                raise HttpResourceGoneError("Http resource gone.")
 
             Error("Retry={0}".format(retry))
             Error("HTTP Req: {0} {1}".format(method, url))
@@ -2691,65 +2805,75 @@ class Util(object):
                 Error("HTTP Err: Reason={0}".format(resp.reason))
                 Error("HTTP Err: Header={0}".format(resp.getheaders()))
                 Error("HTTP Err: Body={0}".format(resp.read()))
-            time.sleep(self.__class__.__RetryWaitingInterval)
-            resp = self._HttpRequest(method, host, action, data, secure, 
-                                     headers)
+
+            time.sleep(self.__class__.RetryWaitingInterval)
+            resp = self._HttpRequest(method, host, path, port=port, data=data, 
+                                     secure=secure, headers=headers,
+                                     proxyHost=proxyHost, proxyPort=proxyPort)
 
         return None
 
-    def HttpGet(self, url, headers=None, maxRetry=3):
-        return self.HttpRequest("GET", url, None, headers, maxRetry)
+    def HttpGet(self, url, headers=None, maxRetry=3, chkProxy=False):
+        return self.HttpRequest("GET", url, headers=headers, 
+                                maxRetry=maxRetry, chkProxy=chkProxy)
         
-    def HttpHead(self, url, headers=None, maxRetry=3):
-        return self.HttpRequest("HEAD", url, None, headers, maxRetry)
+    def HttpHead(self, url, headers=None, maxRetry=3, chkProxy=False):
+        return self.HttpRequest("HEAD", url, headers=headers, 
+                                maxRetry=maxRetry, chkProxy=chkProxy)
         
-    def HttpPost(self, url, data, headers=None, maxRetry=3):
-        return self.HttpRequest("POST", url, data, headers, maxRetry)
+    def HttpPost(self, url, data, headers=None, maxRetry=3, chkProxy=False):
+        return self.HttpRequest("POST", url, data=data, headers=headers, 
+                                maxRetry=maxRetry, chkProxy=chkProxy)
 
-    def HttpPut(self, url, data, headers=None, maxRetry=3):
-        return self.HttpRequest("PUT", url, data, headers, maxRetry)
+    def HttpPut(self, url, data, headers=None, maxRetry=3, chkProxy=False):
+        return self.HttpRequest("PUT", url, data=data, headers=headers, 
+                                maxRetry=maxRetry, chkProxy=chkProxy)
 
-    def HttpDelete(self, url, headers=None, maxRetry=3):
-        return self.HttpRequest("DELETE", url, None, headers, maxRetry)
+    def HttpDelete(self, url, headers=None, maxRetry=3, chkProxy=False):
+        return self.HttpRequest("DELETE", url, headers=headers, 
+                                maxRetry=maxRetry, chkProxy=chkProxy)
     
-    def HttpGetWithoutHeaders(self, url, maxRetry=3):
+    def HttpGetWithoutHeaders(self, url, maxRetry=3, chkProxy=False):
         """
         Return data from an HTTP get on 'url'.
         """
-        resp = self.HttpGet(url, None, maxRetry)
+        resp = self.HttpGet(url, headers=None, maxRetry=maxRetry, 
+                            chkProxy=chkProxy)
         return resp.read() if resp is not None else None
 
-    def HttpGetWithHeaders(self, url, maxRetry=3):
+    def HttpGetWithHeaders(self, url, maxRetry=3, chkProxy=False):
         """
         Return data from an HTTP get on 'url' with
         x-ms-agent-name and x-ms-version
         headers.
         """
-        resp = self.HttpGet(url, {
+        resp = self.HttpGet(url, headers={
             "x-ms-agent-name": GuestAgentName, 
             "x-ms-version": ProtocolVersion
-        }, maxRetry)
+        }, maxRetry=maxRetry, chkProxy=chkProxy)
         return resp.read() if resp is not None else None
 
-    def HttpSecureGetWithHeaders(self, url, transportCert, maxRetry=3):
+    def HttpSecureGetWithHeaders(self, url, transportCert, maxRetry=3, 
+                                 chkProxy=False):
         """
         Return output of get using ssl cert.
         """
-        resp = self.HttpGet(url, {
+        resp = self.HttpGet(url, headers={
             "x-ms-agent-name": GuestAgentName,
             "x-ms-version": ProtocolVersion,
             "x-ms-cipher-name": "DES_EDE3_CBC",
             "x-ms-guest-agent-public-x509-cert": transportCert
-        }, maxRetry)
+        }, maxRetry=maxRetry, chkProxy=chkProxy)
         return resp.read() if resp is not None else None
 
-    def HttpPostWithHeaders(self, url, data, maxRetry=3):
-        header = {
+    def HttpPostWithHeaders(self, url, data, maxRetry=3, chkProxy=False):
+        headers = {
             "x-ms-agent-name": GuestAgentName,
             "Content-Type": "text/xml; charset=utf-8",
             "x-ms-version": ProtocolVersion
         }
-        return self.HttpPost(url, data, header, maxRetry)
+        return self.HttpPost(url, data=data, headers=headers, 
+                             maxRetry=maxRetry, chkProxy=chkProxy)
 
 __StorageVersion="2014-02-14"
 
@@ -2761,7 +2885,7 @@ def GetBlobType(url):
     blobPropResp = restutil.HttpHead(url, {
         "x-ms-date" :  timestamp,
         'x-ms-version' : __StorageVersion
-    });
+    }, chkProxy=True);
     blobType = None
     if blobPropResp is None:
         Error("Can't get status blob type.")
@@ -2779,7 +2903,7 @@ def PutBlockBlob(url, data):
         "x-ms-blob-type" : "BlockBlob",
         "Content-Length": str(len(data)),
         "x-ms-version" : __StorageVersion
-    })
+    }, chkProxy=True)
     if ret is None:
         Error("Failed to upload block blob for status.")
 
@@ -2795,7 +2919,7 @@ def PutPageBlob(url, data):
         "Content-Length": "0",
         "x-ms-blob-content-length" : str(pageBlobSize),
         "x-ms-version" : __StorageVersion
-    })
+    }, chkProxy=True)
     if ret is None:
         Error("Failed to clean up page blob for status")
         return
@@ -2817,13 +2941,13 @@ def PutPageBlob(url, data):
         bufSize = pageEnd - start
         buf = bytearray(bufSize)
         buf[0 : contentSize] = data[start : end]
-        ret = restutil.HttpPut(url, buf, {
+        ret = restutil.HttpPut(url, buffer(buf), {
             "x-ms-date" :  timestamp,
             "x-ms-range" : "bytes={0}-{1}".format(start, pageEnd - 1),
             "x-ms-page-write" : "update",
             "x-ms-version" : __StorageVersion,
             "Content-Length": str(pageEnd - start)
-        })
+        }, chkProxy=True)
         if ret is None:
             Error("Failed to upload page blob for status")
             return
@@ -2900,12 +3024,13 @@ class ConfigurationProvider(object):
     """
     Parse amd store key:values in waagent.conf
     """
-    def __init__(self):
+    def __init__(self, walaConfigFile):
         self.values = dict()
         if 'MyDistro' not in globals():
             global MyDistro
             MyDistro = GetMyDistro()
-        walaConfigFile = MyDistro.getConfigurationPath()
+        if walaConfigFile is None:
+            walaConfigFile = MyDistro.getConfigurationPath()
         if os.path.isfile(walaConfigFile) == False:
             raise Exception("Missing configuration in {0}".format(walaConfigFile))
         try:
@@ -2943,7 +3068,7 @@ class EnvMonitor(object):
         Monitor dhcp client pid and hostname.
         If dhcp clinet process re-start has occurred, reset routes, dhcp with fabric.
         """
-        publish = ConfigurationProvider().get("Provisioning.MonitorHostName")
+        publish = Config.get("Provisioning.MonitorHostName")
         dhcpcmd = MyDistro.getpidcmd+ ' ' + MyDistro.getDhcpClientName()
         dhcppid = RunGetOutput(dhcpcmd)[1]
         while not self.shutdown:
@@ -3154,6 +3279,7 @@ class SharedConfig(object):
         """
         Parse and write configuration to file SharedConfig.xml.
         """
+        LogIfVerbose(xmlText)
         self.reinitialize()
         self.xmlText = xmlText
         dom = xml.dom.minidom.parseString(xmlText)
@@ -3170,25 +3296,17 @@ class SharedConfig(object):
         if nodes is not None and len(nodes) != 0:
             node = nodes[0]
             if node.hasAttribute("rdmaMacAddress"):
-                self.RdmaMacAddress = node.getAttribute("rdmaMacAddress")
+                addr = node.getAttribute("rdmaMacAddress")
+                self.RdmaMacAddress = addr[0:2]
+                for i in range(1, 6):
+                    self.RdmaMacAddress += ":" + addr[2 * i : 2 *i + 2]
             if node.hasAttribute("rdmaIPv4Address"):
                 self.RdmaIPv4Address = node.getAttribute("rdmaIPv4Address")
         return self
     
     def Save(self):
+        LogIfVerbose("Save SharedConfig.xml")
         SetFileContents("SharedConfig.xml", self.xmlText)
-
-    def ConfigRdma(self, dev="/dev/hvnd_rdma"):
-        if self.RdmaIPv4Address is not None and self.RdmaMacAddress is not None:
-            if os.path.isfile(dev):
-                data = ('rdmaMacAddress="{0}" rdmaIPv4Address="{1}"'
-                        '').format(self.RdmaMacAddress, self.RdmaIPv4Address)
-                Log("Write rdma config to {0}: {1}".format(dev, data))
-                try:
-                    with open(dev, "w") as c:
-                        c.write(data)
-                except IOError, e:
-                    Error("Error writing {0}, {1}".format(dev, e))
 
     def InvokeTopologyConsumer(self):
         program = Config.get("Role.TopologyConsumer")
@@ -3199,8 +3317,104 @@ class SharedConfig(object):
                 ErrorWithPrefix('Agent.Run','Exception: '+ str(e) +' occured launching ' + program )
 
     def Process(self):
-        self.ConfigRdma()
+        global rdma_configured
+        if not rdma_configured and self.RdmaMacAddress is not None and self.RdmaIPv4Address is not None:
+            handler = RdmaHandler(self.RdmaMacAddress, self.RdmaIPv4Address)
+            handler.start()
+            rdma_configured = True
         self.InvokeTopologyConsumer()
+
+rdma_configured = False
+
+class RdmaError(Exception):
+    pass
+
+class RdmaHandler(object):
+    """
+    Handle rdma configuration.
+    """
+
+    def __init__(self, mac, ip_addr, dev="/dev/hvnd_rdma",
+                 dat_conf_files=['/etc/dat.conf', '/etc/rdma/dat.conf',
+                                 '/usr/local/etc/dat.conf']):
+        self.mac = mac
+        self.ip_addr = ip_addr
+        self.dev = dev
+        self.dat_conf_files = dat_conf_files
+        self.data = ('rdmaMacAddress="{0}" rdmaIPv4Address="{1}"'
+                     '').format(self.mac, self.ip_addr)
+
+    def start(self):
+        """
+        Start a new thread to process rdma
+        """
+        threading.Thread(target=self.process).start()
+
+    def process(self):
+        try:
+            self.set_dat_conf()
+            self.set_rdma_dev()
+            self.set_rdma_ip()
+        except RdmaError as e:
+            Error("Failed to config rdma device: {0}".format(e))
+
+    def set_dat_conf(self):
+        """
+        Agent needs to search all possible locations for dat.conf
+        """
+        Log("Set dat.conf")
+        for dat_conf_file in self.dat_conf_files:
+            if not os.path.isfile(dat_conf_file):
+                continue
+            try:
+                self.write_dat_conf(dat_conf_file)
+            except IOError as e:
+                raise RdmaError("Failed to write to dat.conf: {0}".format(e))
+
+    def write_dat_conf(self, dat_conf_file):
+        Log("Write config to {0}".format(dat_conf_file))
+        old = ("ofa-v2-ib0 u2.0 nonthreadsafe default libdaplofa.so.2 "
+               "dapl.2.0 \"\S+ 0\"")
+        new = ("ofa-v2-ib0 u2.0 nonthreadsafe default libdaplofa.so.2 "
+               "dapl.2.0 \"{0} 0\"").format(self.ip_addr)
+        lines = GetFileContents(dat_conf_file)
+        lines = re.sub(old, new, lines)
+        SetFileContents(dat_conf_file, lines)
+
+    def set_rdma_dev(self):
+        """
+        Write config string to /dev/hvnd_rdma
+        """
+        Log("Set /dev/hvnd_rdma")
+        self.wait_rdma_dev()
+        self.write_rdma_dev_conf()
+
+    def write_rdma_dev_conf(self):
+        Log("Write rdma config to {0}: {1}".format(self.dev, self.data))
+        try:
+            with open(self.dev, "w") as c:
+                c.write(self.data)
+        except IOError, e:
+            raise RdmaError("Error writing {0}, {1}".format(self.dev, e))
+
+    def wait_rdma_dev(self):
+        Log("Wait for /dev/hvnd_rdma")
+        retry = 0
+        while retry < 120:
+            if os.path.exists(self.dev):
+                return
+            time.sleep(1)
+            retry += 1
+        raise RdmaError("The device doesn't show up in 120 seconds")
+
+    def set_rdma_ip(self):
+        Log("Set ip addr for rdma")
+        try:
+            if_name = MyDistro.getInterfaceNameByMac(self.mac)
+            #Azure is using 12 bits network mask for infiniband.
+            MyDistro.configIpV4(if_name, self.ip_addr, 12)
+        except Exception as e:
+            raise RdmaError("Failed to config rdma device: {0}".format(e))
 
 class ExtensionsConfig(object):
     """
@@ -3355,7 +3569,7 @@ class ExtensionsConfig(object):
                 Log("Plugin server is: " +  self.Util.Endpoint)
                 SimpleLog(p.plugin_log,"Plugin server is: " +  self.Util.Endpoint)
 
-                manifest=self.Util.HttpGetWithoutHeaders(location)
+                manifest=self.Util.HttpGetWithoutHeaders(location, chkProxy=True)
                 if manifest == None:
                     Error("Unable to download plugin manifest" + name + " from primary location.  Attempting with failover location.")
                     SimpleLog(p.plugin_log,"Unable to download plugin manifest" + name + " from primary location.  Attempting with failover location.")
@@ -3364,12 +3578,12 @@ class ExtensionsConfig(object):
                     Log("Plugin failover server is: " +  self.Util.Endpoint)
                     SimpleLog(p.plugin_log,"Plugin failover server is: " +  self.Util.Endpoint)
 
-                    manifest=self.Util.HttpGetWithoutHeaders(failoverlocation)
+                    manifest=self.Util.HttpGetWithoutHeaders(failoverlocation, chkProxy=True)
                 #if failoverlocation also fail what to do then?
                 if manifest == None:
                     AddExtensionEvent(name,WALAEventOperation.Download,False,0,version,"Download mainfest fail "+failoverlocation)
-                    Log("Plugin manifest" + name + "downloaded successfully length = " + str(len(manifest)))
-                    SimpleLog(p.plugin_log,"Plugin manifest" + name + "downloaded successfully length = " + str(len(manifest)))
+                    Log("Plugin manifest " + name + " downloading failed from failover location.")
+                    SimpleLog(p.plugin_log,"Plugin manifest " + name + " downloading failed from failover location.")
 
                 filepath=LibDir+"/" + name + '.' + incarnation + '.manifest'
                 if os.path.splitext(location)[-1] == '.xml' : #if this is an xml file we may have a BOM
@@ -3398,7 +3612,7 @@ class ExtensionsConfig(object):
                 SimpleLog(p.plugin_log,"Bundle URI = " + bundle_uri)
 
                 # Download the zipfile archive and save as '.zip'
-                bundle=self.Util.HttpGetWithoutHeaders(bundle_uri)
+                bundle=self.Util.HttpGetWithoutHeaders(bundle_uri, chkProxy=True)
                 if bundle == None:
                     AddExtensionEvent(name,WALAEventOperation.Download,True,0,version,"Download zip fail "+bundle_uri)
                     Error("Unable to download plugin bundle" + bundle_uri )
@@ -4109,6 +4323,7 @@ class GoalState(Util):
                                                                 LogIfVerbose("SharedConfigUrl:" + self.SharedConfigUrl)
                                                                 self.SharedConfigXml = self.HttpGetWithHeaders(self.SharedConfigUrl)
                                                                 self.SharedConfig = SharedConfig().Parse(self.SharedConfigXml)
+                                                                self.SharedConfig.Save()
                                                             elif e.localName == "ExtensionsConfig":
                                                                 self.ExtensionsConfigUrl = GetNodeTextData(e)
                                                                 LogIfVerbose("ExtensionsConfigUrl:" + self.ExtensionsConfigUrl)
@@ -4137,9 +4352,9 @@ class GoalState(Util):
         """
         Calls HostingEnvironmentConfig.Process()
         """
+        LogIfVerbose("Process goalstate")
         self.HostingEnvironmentConfig.Process()
         self.SharedConfig.Process()
-        self.SharedConfig.Save()
         
 class OvfEnv(object):
     """
@@ -4194,7 +4409,7 @@ class OvfEnv(object):
         self.SshPublicKeys = []
         self.SshKeyPairs = []
 
-    def Parse(self, xmlText):
+    def Parse(self, xmlText, isDeprovision = False):
         """
         Parse xml tree, retreiving user and ssh key information.
         Return self.
@@ -4226,6 +4441,8 @@ class OvfEnv(object):
             return None
         self.ComputerName = GetNodeTextData(section.getElementsByTagNameNS(self.WaNs, "HostName")[0])
         self.UserName = GetNodeTextData(section.getElementsByTagNameNS(self.WaNs, "UserName")[0])
+        if isDeprovision == True:
+          return self
         try:
             self.UserPassword = GetNodeTextData(section.getElementsByTagNameNS(self.WaNs, "UserPassword")[0])
         except:
@@ -5372,9 +5589,17 @@ class Agent(Util):
             lbProbeResponder = False
         while True:
             if (goalState == None) or (incarnation == None) or (goalState.Incarnation != incarnation):
-                goalState = self.UpdateGoalState()
-                if goalState == None :
+                try:
+                    goalState = self.UpdateGoalState()
+                except HttpResourceGoneError as e:
+                    Warn("Incarnation is out of date:{0}".format(e))
+                    incarnation = None
                     continue
+
+                if goalState == None :
+                    Warn("Failed to fetch goalstate")
+                    continue
+
                 if provisioned == False:
                     self.ReportNotReady("Provisioning", "Starting")
 
@@ -5394,7 +5619,15 @@ class Agent(Util):
                         #Get Ctime of wala config, can help identify the base image of this VM
                         AddExtensionEvent(name="WALA",op=WALAEventOperation.Provision,isSuccess=True,
                                               message="WALA Config Ctime:"+lastCtime)
-                        
+
+                        executeCustomData = Config.get("Provisioning.ExecuteCustomData")
+                        if executeCustomData != None and executeCustomData.lower().startswith("y"):
+                          if os.path.exists(LibDir + '/CustomData'):
+                            Run('chmod +x ' + LibDir + '/CustomData')
+                            Run(LibDir + '/CustomData')
+                          else:
+                            Error(LibDir + '/CustomData does not exist.')
+
                 #
                 # only one port supported
                 # restart server if new port is different than old port
@@ -5402,13 +5635,17 @@ class Agent(Util):
                 #
                 goalPort = goalState.LoadBalancerProbePort
                 if currentPort != goalPort:
-                    self.LoadBalancerProbeServer_Shutdown()
-                    currentPort = goalPort
-                    if currentPort != None and lbProbeResponder == True:
-                        self.LoadBalancerProbeServer = LoadBalancerProbeServer(currentPort)
-                        if self.LoadBalancerProbeServer == None :
-                            lbProbeResponder = False
-                            Log("Unable to create LBProbeResponder.")
+                    try:
+                        self.LoadBalancerProbeServer_Shutdown()
+                        currentPort = goalPort
+                        if currentPort != None and lbProbeResponder == True:
+                            self.LoadBalancerProbeServer = LoadBalancerProbeServer(currentPort)
+                            if self.LoadBalancerProbeServer == None :
+                                lbProbeResponder = False
+                                Log("Unable to create LBProbeResponder.")
+                    except Exception, e:
+                        Error("Failed to launch LBProbeResponder: {0}".format(e))
+                        currentPort = None
 
                 # Report SSH key fingerprint
                 type = Config.get("Provisioning.SshHostKeyPairType")
@@ -5445,7 +5682,7 @@ class Agent(Util):
                 eventMonitor = WALAEventMonitor(self.HttpPostWithHeaders)
                 eventMonitor.StartEventsLoop()
 
-            time.sleep(25 - sleepToReduceAccessDenied)	
+            time.sleep(25 - sleepToReduceAccessDenied)
 
             
 WaagentLogrotate = """\
@@ -5539,14 +5776,14 @@ def ReplaceStringInFile(fname,src,repl):
     """
     Replace 'src' with 'repl' in file.
     """
-    updated=''
     try:
         sr=re.compile(src)
         if FindStringInFile(fname,src):
+            updated=''
             for l in (open(fname,'r')).readlines():
                 n=re.sub(sr,repl,l)
                 updated+=n
-        ReplaceFileContentsAtomic(fname,updated)
+            ReplaceFileContentsAtomic(fname,updated)
     except :
         raise
     return
@@ -5706,7 +5943,7 @@ def Deprovision(force, deluser):
     ovfxml = GetFileContents(LibDir+"/ovf-env.xml")
     ovfobj = None
     if ovfxml != None:
-        ovfobj = OvfEnv().Parse(ovfxml)
+        ovfobj = OvfEnv().Parse(ovfxml, True)
 
     print("WARNING! The waagent service will be stopped.")
     print("WARNING! All SSH host key pairs will be deleted.")
@@ -5785,6 +6022,7 @@ def main():
     if MyDistro == None :
         sys.exit(1)
     args = []
+    conf_file = None
     global force
     force = False
     for a in sys.argv[1:]:
@@ -5797,6 +6035,8 @@ def main():
             myLogger.verbose = True
         elif re.match("^([-/]*)force", a):
             force = True
+        elif re.match("^(?:[-/]*)conf=.+", a):
+            conf_file = re.match("^(?:[-/]*)conf=(.+)", a).groups()[0]
         elif re.match("^([-/]*)(setup|install)", a):
             sys.exit(MyDistro.Install())
         elif re.match("^([-/]*)(uninstall)", a):
@@ -5804,8 +6044,14 @@ def main():
         else:
             args.append(a)
     global Config
-    Config = ConfigurationProvider()
+    Config = ConfigurationProvider(conf_file)
     
+    logfile = Config.get("Logs.File")
+    if logfile is not None:
+        myLogger.file_path = logfile
+    logconsole = Config.get("Logs.Console")
+    if logconsole is not None and logconsole.lower().startswith("n"):
+        myLogger.con_path = None
     verbose = Config.get("Logs.Verbose")
     if verbose != None and verbose.lower().startswith("y"):
         myLogger.verbose=True
